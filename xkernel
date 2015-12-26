@@ -1,0 +1,202 @@
+#!/usr/bin/python3
+
+import getopt, sys, os, subprocess
+
+VERSION="1.0"
+
+def usage():
+	print("""hi
+	
+To use with --build-dst, make sure --build-src has no .config and has been mrproper'd, and that .config exists in build_dst.
+	
+	
+	
+	
+	
+	""")
+
+class CommandRunner(object):
+
+	"CommandRunner is a class that allows commands to run, and messages to be displayed. By default, output will go to a log file. Messages will appear on stdout and in the logs."
+
+	def __init__(self, logpath=None):
+		self.logpath = logpath
+		if self.logpath:
+			if not os.path.exists(os.path.dirname(self.logpath)):
+				os.path.makedirs(self.logpath)
+			self.cmdout = open(self.logpath,"w+")
+			sys.stdout.write("Logging output to %s.\n" % self.logpath)
+
+	def mesg(self, msg):
+		if self.logpath:
+			self.cmdout.write(msg + "\n")
+			self.cmdout.flush()
+		sys.stdout.write(msg + "\n")
+
+	def run(self, cmdargs, env, error_scan=False):
+		self.mesg("> Running command: %s (env %s) " % ( cmdargs,env ))
+		try:
+			if self.logpath:
+				cmd = subprocess.Popen(cmdargs, env=env, stdout=self.cmdout, stderr=subprocess.STDOUT)
+			else:
+				cmd = subprocess.Popen(cmdargs, env=env)
+			exitcode = cmd.wait()
+		except KeyboardInterrupt:
+			cmd.terminate()
+			self.mesg("Interrupted via keyboard!")
+			raise
+		else:
+			if exitcode != 0:
+				self.mesg("Command exited with return code %s" % exitcode)
+				return exitcode
+			return 0
+
+def abspath(x):
+	return os.path.abspath(os.path.normpath(os.path.expanduser(x)))
+
+kern_target = {
+	"x86_64" : "bzImage",
+	"x86" : "bzImage"
+}
+
+kern_path = {
+	"x86_64" : "arch/x86_64/boot/bzImage",
+	"x86" : "arch/x86/boot/bzImage"
+}
+
+def main():
+	s, o = subprocess.getstatusoutput("lscpu -b -e")
+	num_cores = len(o.split('\n')) - 1
+	print(">", os.path.basename(sys.argv[0]), VERSION +  "; Using %s CPU cores." % num_cores)
+	s, o = subprocess.getstatusoutput("uname -m")
+	arch = o
+	try:
+		opts, args = getopt.getopt(sys.argv[1:], "ho:v", ["help", "output=", "extraversion=" "firmware-dst=", "kernel-cc=", "kernel-ld=", "kernel-as=", "utils-cc=", "build-src=", "build-dst=", "config="])
+	except getopt.GetoptError as err:
+		# print help information and exit:
+		print(err) # will print something like "option -a not recognized"
+		usage()
+		sys.exit(2)
+	output = None
+	verbose = False
+	k_evars = {}
+	u_evars = {}
+	makeopts = "-j%s" % num_cores
+	k_config = None
+	build_src = None
+	build_dst = None
+	extraversion = None
+	install_mod_path = None
+	for o, a in opts:
+		if o == "-v":
+			verbose = True
+		elif o in ("-h", "--help"):
+			usage()
+			sys.exit()
+		elif o in ("-o", "--output"):
+			output = a
+		elif o in ("--firmware-dst",):
+			k_evars["INSTALL_FW_PATH"] = a
+		elif o in ("--kernel-cc",):
+			k_evars["CC"] = a
+		elif o in ("--kernel-ld",):
+			k_evars["LD"] = a
+		elif o in ("--kernel-as",):
+			k_evars["AS"] = a
+		elif o in ("--utils-cc",):
+			u_evars["CC"] = a
+		elif o in ("--build-dst",):
+			build_dst = a
+		elif o in ("--build-src",):
+			build_src = a
+		elif o in ("--extraversion",):
+			k_evars["EXTRAVERSION"] = a
+		elif o in ("--modules-dst",):
+			install_mod_path = a
+			# will install modules into $INSTALL_MOD_PATH/lib/modules
+			k_evars["INSTALL_MOD_PATH"] = a
+		elif o in ("--config",):
+			k_config = a
+		else:
+			assert False, "unhandled option"
+	if build_src == None:
+		build_src = "/usr/src/linux"
+	if build_dst == None:
+		build_dst = build_src
+	else:
+		k_evars["O"]=build_dst
+	if k_config == None:
+		k_config = os.path.join(build_src,".config")
+	build_src = abspath(build_src)
+	build_dst = abspath(build_dst)
+	k_config = abspath(k_config)
+	if not os.path.exists(k_config):
+		print("! Kernel config %s not found. Exiting." % k_config)
+		sys.exit(1)
+	print("> Building kernel sources at %s using kernel config %s in build directory %s." % (build_src, k_config, build_dst))
+	k_config_dest = os.path.join(build_dst, ".config")
+	cr = CommandRunner()
+	k_cmdvars = []
+	for k in k_evars:
+		k_cmdvars.append("%s=%s" % ( k, k_evars[k] ))
+	if k_config != k_config_dest:
+		cr.run(["cp", k_config, k_config_dest ], env={})
+	os.chdir(build_src)
+	for arg in args:
+		build_kernel = False
+		if arg in [ "kernel", kern_target[arch]]:
+			arg = kern_path[arch]
+			build_kernel = True
+		if arg in [ "modules_install", "firmware_install" ]:
+			mo = "-j1"
+		else:
+			mo = makeopts
+		# run make command:
+		retval = cr.run(["make"] + k_cmdvars + [ mo, arg ], env={})
+		if retval != 0:
+			print("! Compile failed. Aborting.")
+			sys.exit(1)
+		# after-make steps:
+		if build_kernel:
+			# Find kernel goodies:
+			if os.path.exists(os.path.join(build_dst,kern_path[arch])):
+				print("Found kernel!")
+		elif arg == "modules_install":
+			# Run depmod after we're done...
+			cmdlist = [ "depmod", "-a", "-e", "-F", os.path.join( build_dst, "System.map" ) ]
+			if install_mod_path:
+				cmdlist += [ "-b", install_mod_path ]
+			retval = cr.run(cmdlist)
+			if retval != 0:
+				print("modules_install error.")
+main()
+sys.exit(0)
+
+"""
+. arch/${uname -m}.conf
+
+[ -n $INSTALL_FW_PATH ] && echo "Installing firmware to ${INSTALL_FW_PATH}"
+[ -
+
+cd ${BUILD_SRC}
+if [ "${BUILD_SRC}" != "${BUILD_DST}" ]; then
+		ARGS="${ARGS} O=\"${BUILD_DST}\""
+fi
+if [ -n ${FIRMWARE_DST} ]; then
+		ARGS="${ARGS} INSTALL_FW_PATH=\"${BUILD_DST}\""
+fi
+make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS $KERNEL_MAKE_TARGET
+make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS modules
+make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS -j1 modules_install
+	if [ "${INSTALL_MOD_PATH}" != '' ]
+	then
+		depmod -a -e -F "${KERNEL_OUTPUTDIR}"/System.map -b "${INSTALL_MOD_PATH}" ${KV}
+	else
+		depmod -a -e -F "${KERNEL_OUTPUTDIR}"/System.map ${KV}
+	fi
+make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS -j1 firmware_install
+# grab O/kernel binary
+# grab O/System.map
+
+"""
+# vim: ts=4 sw=4 noet
