@@ -9,9 +9,7 @@ def usage():
 	
 To use with --build-dst, make sure --build-src has no .config and has been mrproper'd, and that .config exists in build_dst.
 	
-	
-	
-	
+./xkernel --build-dst=/tmp --config=/tmp/.config bzImage modules /var/tmp/foo
 	
 	""")
 
@@ -33,7 +31,7 @@ class CommandRunner(object):
 			self.cmdout.flush()
 		sys.stdout.write(msg + "\n")
 
-	def run(self, cmdargs, env, error_scan=False):
+	def run(self, cmdargs, env={}, error_scan=False):
 		self.mesg("> Running command: %s (env %s) " % ( cmdargs,env ))
 		try:
 			if self.logpath:
@@ -70,8 +68,12 @@ def main():
 	print(">", os.path.basename(sys.argv[0]), VERSION +  "; Using %s CPU cores." % num_cores)
 	s, o = subprocess.getstatusoutput("uname -m")
 	arch = o
+	destpath = abspath(sys.argv[-1])
+	if not os.path.exists(destpath):
+		print("Destination path %s does not exist. Exiting." % destpath)
+		sys.exit(1)
 	try:
-		opts, args = getopt.getopt(sys.argv[1:], "ho:v", ["help", "output=", "extraversion=" "firmware-dst=", "kernel-cc=", "kernel-ld=", "kernel-as=", "utils-cc=", "build-src=", "build-dst=", "config="])
+		opts, args = getopt.getopt(sys.argv[1:-1], "ho:v", ["help", "output=", "extraversion=" "firmware-dst=", "kernel-cc=", "kernel-ld=", "kernel-as=", "utils-cc=", "build-src=", "build-dst=", "config="])
 	except getopt.GetoptError as err:
 		# print help information and exit:
 		print(err) # will print something like "option -a not recognized"
@@ -142,7 +144,8 @@ def main():
 	if k_config != k_config_dest:
 		cr.run(["cp", k_config, k_config_dest ], env={})
 	os.chdir(build_src)
-	for arg in args:
+	kernel_version = None
+	for arg in [ "kernelversion" ] + args:
 		build_kernel = False
 		if arg in [ "kernel", kern_target[arch]]:
 			arg = kern_path[arch]
@@ -152,18 +155,29 @@ def main():
 		else:
 			mo = makeopts
 		# run make command:
-		retval = cr.run(["make"] + k_cmdvars + [ mo, arg ], env={})
+		all_args = [ "make" ] + k_cmdvars + [ mo, arg ]
+		if arg == "kernelversion":
+			# here, we want to capture output
+			s, o = subprocess.getstatusoutput(" ".join(all_args))
+			if s == 0:
+				kernel_version = o
+				print("> Building kernel version %s." % kernel_version)
+		else:
+			retval = cr.run(all_args)
 		if retval != 0:
 			print("! Compile failed. Aborting.")
 			sys.exit(1)
 		# after-make steps:
 		if build_kernel:
 			# Find kernel goodies:
-			if os.path.exists(os.path.join(build_dst,kern_path[arch])):
-				print("Found kernel!")
+			my_kern_path = os.path.join(build_dst,kern_path[arch])
+			if os.path.exists(my_kern_path):
+				cr.run(["cp", my_kern_path, destpath ])
+			cr.run(["cp", os.path.join(build_dst, "System.map"), destpath])
 		elif arg == "modules_install":
+			# TODO: avoid overwriting existing modules which can lead to unbootable system. :(
 			# Run depmod after we're done...
-			cmdlist = [ "depmod", "-a", "-e", "-F", os.path.join( build_dst, "System.map" ) ]
+			cmdlist = [ "/sbin/depmod", "-a", "-e", "-F", os.path.join( build_dst, "System.map" ) ]
 			if install_mod_path:
 				cmdlist += [ "-b", install_mod_path ]
 			retval = cr.run(cmdlist)
