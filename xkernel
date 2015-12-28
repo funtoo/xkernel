@@ -135,7 +135,7 @@ def main():
 	if not os.path.exists(k_config):
 		print("! Kernel config %s not found. Exiting." % k_config)
 		sys.exit(1)
-	print("> Building kernel sources at %s using kernel config %s in build directory %s." % (build_src, k_config, build_dst))
+	print("> Using %s directory for build." % build_dst)
 	k_config_dest = os.path.join(build_dst, ".config")
 	cr = CommandRunner()
 	k_cmdvars = []
@@ -161,12 +161,12 @@ def main():
 			s, o = subprocess.getstatusoutput(" ".join(all_args))
 			if s == 0:
 				kernel_version = o
-				print("> Building kernel version %s." % kernel_version)
+				print("> Found kernel version %s at %s." % ( kernel_version, build_src) )
 		else:
 			retval = cr.run(all_args)
-		if retval != 0:
-			print("! Compile failed. Aborting.")
-			sys.exit(1)
+			if retval != 0:
+				print("! Compile failed. Aborting.")
+				sys.exit(1)
 		# after-make steps:
 		if build_kernel:
 			# Find kernel goodies:
