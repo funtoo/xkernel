@@ -1,216 +1,180 @@
 #!/usr/bin/python3
 
-import getopt, sys, os, subprocess
+import sys, os, subprocess
+import cmdtools
+import logging
+from argparse import ArgumentParser
 
 VERSION="1.0"
-
-def usage():
-	print("""hi
-	
-To use with --build-dst, make sure --build-src has no .config and has been mrproper'd, and that .config exists in build_dst.
-	
-./xkernel --build-dst=/tmp --config=/tmp/.config bzImage modules /var/tmp/foo
-	
-	""")
-
-class CommandRunner(object):
-
-	"CommandRunner is a class that allows commands to run, and messages to be displayed. By default, output will go to a log file. Messages will appear on stdout and in the logs."
-
-	def __init__(self, logpath=None):
-		self.logpath = logpath
-		if self.logpath:
-			if not os.path.exists(os.path.dirname(self.logpath)):
-				os.path.makedirs(self.logpath)
-			self.cmdout = open(self.logpath,"w+")
-			sys.stdout.write("Logging output to %s.\n" % self.logpath)
-
-	def mesg(self, msg):
-		if self.logpath:
-			self.cmdout.write(msg + "\n")
-			self.cmdout.flush()
-		sys.stdout.write(msg + "\n")
-
-	def run(self, cmdargs, env={}, error_scan=False):
-		self.mesg("> Running command: %s (env %s) " % ( cmdargs,env ))
-		try:
-			if self.logpath:
-				cmd = subprocess.Popen(cmdargs, env=env, stdout=self.cmdout, stderr=subprocess.STDOUT)
-			else:
-				cmd = subprocess.Popen(cmdargs, env=env)
-			exitcode = cmd.wait()
-		except KeyboardInterrupt:
-			cmd.terminate()
-			self.mesg("Interrupted via keyboard!")
-			raise
-		else:
-			if exitcode != 0:
-				self.mesg("Command exited with return code %s" % exitcode)
-				return exitcode
-			return 0
 
 def abspath(x):
 	return os.path.abspath(os.path.normpath(os.path.expanduser(x)))
 
-kern_target = {
-	"x86_64" : "bzImage",
-	"x86" : "bzImage"
-}
+class KernelBuilderException(Exception):
+	def __init__(self, code, message):
+		self.message = message
+		self.code = code
 
-kern_path = {
-	"x86_64" : "arch/x86_64/boot/bzImage",
-	"x86" : "arch/x86/boot/bzImage"
-}
+	def __str__(self):
+		return repr(self.code) + ": " + self.message
 
-def main():
-	s, o = subprocess.getstatusoutput("lscpu -b -e")
-	num_cores = len(o.split('\n')) - 1
-	print(">", os.path.basename(sys.argv[0]), VERSION +  "; Using %s CPU cores." % num_cores)
-	s, o = subprocess.getstatusoutput("uname -m")
-	arch = o
-	destpath = abspath(sys.argv[-1])
-	if not os.path.exists(destpath):
-		print("Destination path %s does not exist. Exiting." % destpath)
-		sys.exit(1)
-	try:
-		opts, args = getopt.getopt(sys.argv[1:-1], "ho:v", ["help", "output=", "extraversion=" "firmware-dst=", "kernel-cc=", "kernel-ld=", "kernel-as=", "utils-cc=", "build-src=", "build-dst=", "config="])
-	except getopt.GetoptError as err:
-		# print help information and exit:
-		print(err) # will print something like "option -a not recognized"
-		usage()
-		sys.exit(2)
-	output = None
-	verbose = False
-	k_evars = {}
-	u_evars = {}
-	makeopts = "-j%s" % num_cores
-	k_config = None
-	build_src = None
-	build_dst = None
-	extraversion = None
-	install_mod_path = None
-	for o, a in opts:
-		if o == "-v":
-			verbose = True
-		elif o in ("-h", "--help"):
-			usage()
-			sys.exit()
-		elif o in ("-o", "--output"):
-			output = a
-		elif o in ("--firmware-dst",):
-			k_evars["INSTALL_FW_PATH"] = a
-		elif o in ("--kernel-cc",):
-			k_evars["CC"] = a
-		elif o in ("--kernel-ld",):
-			k_evars["LD"] = a
-		elif o in ("--kernel-as",):
-			k_evars["AS"] = a
-		elif o in ("--utils-cc",):
-			u_evars["CC"] = a
-		elif o in ("--build-dst",):
-			build_dst = a
-		elif o in ("--build-src",):
-			build_src = a
-		elif o in ("--extraversion",):
-			k_evars["EXTRAVERSION"] = a
-		elif o in ("--modules-dst",):
-			install_mod_path = a
-			# will install modules into $INSTALL_MOD_PATH/lib/modules
-			k_evars["INSTALL_MOD_PATH"] = a
-		elif o in ("--config",):
-			k_config = a
+class KernelBuilder(object):
+
+	kern_target = {
+		"x86_64" : "bzImage",
+		"x86" : "bzImage"
+	}
+
+	kern_path = {
+		"x86_64" : "arch/x86/boot/bzImage",
+		"x86" : "arch/x86/boot/bzImage"
+	}
+
+	all_kernel_env_vars = {
+		"extraversion" : "EXTRAVERSION",
+		"modules_dst" : "INSTALL_MOD_PATH",
+		"firmware_dst" : "INSTALL_FW_PATH",
+		"kernel_cc" : "CC",
+		"kernel_ld" : "LD",
+		"kernel_as" : "AS"
+	}
+
+	def getKernelEnvVars(self):
+		out = []
+		for var, val in self.kernel_env_vars.items():
+			out.append("%s=%s" % ( var, val))
+		return out
+
+	def getKernelVersion(self):
+		s, o = subprocess.getstatusoutput(("cd %s; make kernelversion" % self.build_src))
+		if s == 0:
+			logging.info("Found kernel version %s." % o )
+			return o
 		else:
-			assert False, "unhandled option"
-	if build_src == None:
-		build_src = "/usr/src/linux"
-	if build_dst == None:
-		build_dst = build_src
-	else:
-		k_evars["O"]=build_dst
-	if k_config == None:
-		k_config = os.path.join(build_src,".config")
-	build_src = abspath(build_src)
-	build_dst = abspath(build_dst)
-	k_config = abspath(k_config)
-	if not os.path.exists(k_config):
-		print("! Kernel config %s not found. Exiting." % k_config)
-		sys.exit(1)
-	print("> Using %s directory for build." % build_dst)
-	k_config_dest = os.path.join(build_dst, ".config")
-	cr = CommandRunner()
-	k_cmdvars = []
-	for k in k_evars:
-		k_cmdvars.append("%s=%s" % ( k, k_evars[k] ))
-	if k_config != k_config_dest:
-		cr.run(["cp", k_config, k_config_dest ], env={})
-	os.chdir(build_src)
-	kernel_version = None
-	for arg in [ "kernelversion" ] + args:
+			raise KernelBuilderException(1, "Could not determine kernel version.")
+
+	def generateTasks(self):
+	
+		tasklist = cmdtools.TaskList()
+
+		kern_envvars = self.getKernelEnvVars()
+		kern_version = None
+		build_dst = self.settings['build_dst'] if self.settings['build_dst'] != None else self.build_src
+		kern_target = self.kern_target[self.arch]
+		kern_subpath = self.kern_path[self.arch]
+		kern_abspath = os.path.join(build_dst, kern_subpath)
 		build_kernel = False
-		if arg in [ "kernel", kern_target[arch]]:
-			arg = kern_path[arch]
-			build_kernel = True
-		if arg in [ "modules_install", "firmware_install" ]:
-			mo = "-j1"
+
+		for target in self.settings['targets']:
+
+			build_kernel = False
+
+			logging.info("Building target: " + target)
+
+			if target in [ 'kernel', kern_target]:
+				target = kern_target
+				build_kernel = True
+			if target in [ kern_target, 'modules', 'scripts', 'prepare', 'all', 'vmlinux' ]:
+				mo = "-j%s" % repr(self.num_cores + 1)
+			else:
+				mo = "-j1"
+		
+			all_args = [ "make" ] + kern_envvars + [ mo, target ]
+			tasklist.append(cmdtools.Task(all_args, cwd=self.build_src))
+
+			# POST-MAKE
+
+			if build_kernel:
+				if os.path.exists(kern_abspath):
+					kernel_name = self.settings['kernel_name']
+					if kernel_name == None:
+						kernel_name = os.path.basename(kern_abspath)
+					sysmap_name = "System.map"
+					if self.settings['suffix']:
+						kernel_name += self.settings['suffix'].replace("%k", self.kernel_version)
+						sysmap_name += self.settings['suffix'].replace("%k", self.kernel_version)
+
+					tasklist.append(cmdtools.Task(["cp", kern_abspath, self.settings['dest'] + "/" + kernel_name ]))
+					tasklist.append(cmdtools.Task(["cp", os.path.join(build_dst, "System.map"), self.settings['dest'] + "/" + sysmap_name ]))
+			elif target == "modules_install":
+				cmdlist = [ "/sbin/depmod", "-a", "-e", "-F", os.path.join( build_dst, "System.map" ) ]
+				if self.settings['modules_dst'] != '/':
+					cmdlist += [ "-b", install_mod_path ]
+				tasklist.append(cmdtools.Task(cmdlist, cwd=self.build_src))
+
+		self.tasklist = tasklist
+
+	def __init__(self, **settings):
+
+		self.kernel_env_vars = {}
+		self.tasklist = None
+		self.settings = settings
+		
+		self.build_src = self.settings['build_src']
+		self.kernel_version = self.getKernelVersion()
+		s, o = subprocess.getstatusoutput("lscpu -b -e")
+		self.num_cores = len(o.split('\n')) - 1
+
+		# IDENTIFY CPU, HOST:
+
+		s, self.arch = subprocess.getstatusoutput("uname -m")
+		if self.arch not in self.kern_target:
+			raise KernelBuilderException(2, "Unspported arch: %s" % self.arch)
+
+		logging.info(os.path.basename(sys.argv[0]) + " " + VERSION +  "; Using %s CPU cores." % self.num_cores)
+		logging.info("Found kernel version %s." % self.kernel_version)
+
+		# prep kernel env vars for calling make:
+		for opt, env_var in self.all_kernel_env_vars.items():
+			if opt in self.settings and self.settings[opt] != None:
+				self.kernel_env_vars[env_var] = self.settings[opt]
+
+	def run(self):
+
+		self.generateTasks()
+		r = cmdtools.TaskRunner(self.tasklist)
+		success = r.run()
+		if not success:
+			raise KernelBuilderException(3,"Build failed.")
+
+def getCommandLine():
+	
+	parser = ArgumentParser(prog="xkernel")
+	parser.add_argument("-e", "--extraversion", action="store", dest="extraversion", default=None, help="Set extra name to be appended to end of kernel version.")
+	parser.add_argument("-v", "--verbose", action="store_true", dest="verbose", default=False, help="Enable verbose mode.")
+	parser.add_argument("-p", "--pretend", action="store_true", dest="pretend", default=False, help="Enable pretend mode.")
+	parser.add_argument("--kernel-cc", action="store", dest="kernel_cc", default="/usr/bin/gcc", help="Set default compiler. (default:gcc)")
+	parser.add_argument("--kernel-ld", action="store", dest="kernel_ld", default="/usr/bin/ld", help="Set default linker. (default:ld)")
+	parser.add_argument("--kernel-as", action="store", dest="kernel_as", default="/usr/bin/as", help="Set default assembler. (default:as)")
+	parser.add_argument("--utils-cc", action="store", dest="utils_cc", default=None, help="Set C compiler for non-kernel building. (default:KERNEL_CC)")
+	parser.add_argument("--build-src", action="store", dest="build_src", default="/usr/src/linux", help="Set source code location. (default:/usr/src/linux)")
+	parser.add_argument("--build-dst", action="store", dest="build_dst", default=None, help="Set source code location. (default:BUILD_SRC)")
+	parser.add_argument("--config", action="store", dest="config", default="/usr/src/linux/.config", help="Specify kernel config to use. (default:BUILD_SRC/.config")
+	parser.add_argument("--modules-dst", action="store", dest="modules_dst", default="/", help="Destination root filesystem for modules installation (default:/)")
+	parser.add_argument("--firmware-dst", action="store", dest="firmware_dst", default="/lib/firmware", help="Set destintation install path for firmware. (default:/lib/firmware)")
+	parser.add_argument("--kernel-name", action="store", dest="kernel_name", default=None, help="Rename kernel binary to this on installation. (default: don't rename)")
+	parser.add_argument("--suffix", action="store", dest="suffix", default=None, help="Add this suffix to all installed files. (default: don't add suffix)")
+	parser.add_argument("--log", action="store", dest="log", default=None, help="Specify file to log compilation. (default:None)")
+	parser.add_argument("--dest", action="store", dest="dest", default="/var/tmp", help="Specify destination install path. (default:/var/tmp)")
+	parser.add_argument("--version", action="version", version='%(prog)s ' + VERSION)
+	parser.add_argument("targets", metavar="target", nargs='+', help="Makefile targets to build.")
+
+	return vars(parser.parse_args())
+
+if __name__ == "__main__":
+	try:
+		settings = getCommandLine()
+		if not settings:
+			sys.exit(1)
+		builder = KernelBuilder(**settings)
+		if settings['pretend']:
+			builder.generateTasks()
+			for task in  builder.tasklist:
+				print(task.cmdlist, "in", task.cwd if task.cwd else "cwd")
 		else:
-			mo = makeopts
-		# run make command:
-		all_args = [ "make" ] + k_cmdvars + [ mo, arg ]
-		if arg == "kernelversion":
-			# here, we want to capture output
-			s, o = subprocess.getstatusoutput(" ".join(all_args))
-			if s == 0:
-				kernel_version = o
-				print("> Found kernel version %s at %s." % ( kernel_version, build_src) )
-		else:
-			retval = cr.run(all_args)
-			if retval != 0:
-				print("! Compile failed. Aborting.")
-				sys.exit(1)
-		# after-make steps:
-		if build_kernel:
-			# Find kernel goodies:
-			my_kern_path = os.path.join(build_dst,kern_path[arch])
-			if os.path.exists(my_kern_path):
-				cr.run(["cp", my_kern_path, destpath ])
-			cr.run(["cp", os.path.join(build_dst, "System.map"), destpath])
-		elif arg == "modules_install":
-			# TODO: avoid overwriting existing modules which can lead to unbootable system. :(
-			# Run depmod after we're done...
-			cmdlist = [ "/sbin/depmod", "-a", "-e", "-F", os.path.join( build_dst, "System.map" ) ]
-			if install_mod_path:
-				cmdlist += [ "-b", install_mod_path ]
-			retval = cr.run(cmdlist)
-			if retval != 0:
-				print("modules_install error.")
-main()
-sys.exit(0)
+			builder.run()
+	except KernelBuilderException as e:
+		print(sys.argv[0]+": error:", e.message)
+		sys.exit(e.code)
 
-"""
-. arch/${uname -m}.conf
-
-[ -n $INSTALL_FW_PATH ] && echo "Installing firmware to ${INSTALL_FW_PATH}"
-[ -
-
-cd ${BUILD_SRC}
-if [ "${BUILD_SRC}" != "${BUILD_DST}" ]; then
-		ARGS="${ARGS} O=\"${BUILD_DST}\""
-fi
-if [ -n ${FIRMWARE_DST} ]; then
-		ARGS="${ARGS} INSTALL_FW_PATH=\"${BUILD_DST}\""
-fi
-make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS $KERNEL_MAKE_TARGET
-make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS modules
-make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS -j1 modules_install
-	if [ "${INSTALL_MOD_PATH}" != '' ]
-	then
-		depmod -a -e -F "${KERNEL_OUTPUTDIR}"/System.map -b "${INSTALL_MOD_PATH}" ${KV}
-	else
-		depmod -a -e -F "${KERNEL_OUTPUTDIR}"/System.map ${KV}
-	fi
-make CC=${KERNEL_CC} LD=${KERNEL_LD} AS=${KERNEL_AS} ARCH=${KERNEL_ARCH} INSTALL_FW_PATH=${FIRMWARE_DST} $ARGS -j1 firmware_install
-# grab O/kernel binary
-# grab O/System.map
-
-"""
 # vim: ts=4 sw=4 noet
