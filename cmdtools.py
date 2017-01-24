@@ -2,6 +2,7 @@
 
 import subprocess
 import threading
+import logging
 import sys
 from datetime import datetime
 
@@ -95,6 +96,7 @@ class TaskRunner(object):
 		return self.tasks.returncode
 
 	def execute(self, cmdlist, cwd=None):
+		logging.debug("Running command '" + " ".join(cmdlist) + "' in " % cwd if cwd else "(cwd)")
 		p1 = subprocess.Popen(cmdlist, shell=False, stdout=self.stdout, stderr=self.stderr, cwd=cwd)
 		if self.outfile:
 			for line in p1.stdout:
